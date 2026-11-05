@@ -1,8 +1,9 @@
 // POST /api/login  - viewer enters the password of ONE project.
-import { safeEqual, hexSha, isLocked, addFail, clearFails, sign, sessionSecret, setCookie, projectCode, SESSION_SECONDS } from "../lib/auth.mjs";
+import { hexSha, isLocked, addFail, clearFails, sign, sessionSecret, setCookie, projectCode, SESSION_SECONDS } from "../lib/auth.mjs";
 import { html, pageShell } from "../lib/util.mjs";
 import { loginPage } from "../lib/pages.mjs";
 import { locks, audit } from "../lib/store.mjs";
+import { getProject, checkPassword } from "../lib/registry.mjs";
 
 export default async (req, context) => {
   if (req.method !== "POST") return new Response(null, { status: 303, headers: { Location: "/" } });
@@ -22,8 +23,8 @@ export default async (req, context) => {
     return html(loginPage(code, "Too many wrong attempts. Please wait 15 minutes and try again."), 429);
   }
 
-  const expected = process.env["PW_" + code] || "";
-  const ok = expected.length >= 8 && safeEqual(password, expected);
+  const project = await getProject(code);
+  const ok = !!project && checkPassword(project, code, password);
   if (!ok) {
     await addFail(L, ipKey); await addFail(L, projKey);
     await audit("login_fail", { project: code, ip: hexSha(ip).slice(0, 12) });

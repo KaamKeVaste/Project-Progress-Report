@@ -6,6 +6,7 @@ export function setStoreFactory(f) { factory = f; } // used by the automated tes
 export const snaps = () => factory("snapshots");
 export const locks = () => factory("locks");
 export const auditStore = () => factory("audit");
+export const registryStore = () => factory("projects"); // projects added on the /admin page
 
 export async function audit(type, data = {}) {
   try {

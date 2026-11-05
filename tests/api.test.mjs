@@ -11,6 +11,9 @@ process.env.PW_HLX3 = "Helix-Pass-2026";
 const { setStoreFactory } = await import("../netlify/lib/store.mjs");
 const { PROJECTS } = await import("../netlify/lib/projects.mjs");
 const { sign } = await import("../netlify/lib/auth.mjs");
+const { projectKey } = await import("../netlify/lib/registry.mjs");
+const { titleCode } = await import("../netlify/lib/transform.mjs");
+const admin = (await import("../netlify/functions/admin.mjs")).default;
 const publish = (await import("../netlify/functions/publish.mjs")).default;
 const login = (await import("../netlify/functions/login.mjs")).default;
 const view = (await import("../netlify/functions/view.mjs")).default;
@@ -29,6 +32,7 @@ setStoreFactory((name) => {
     async get(k) { return m.has(k) ? JSON.parse(m.get(k)) : null; },
     async setJSON(k, v) { m.set(k, JSON.stringify(v)); },
     async delete(k) { m.delete(k); },
+    async list() { return { blobs: [...m.keys()].map((key) => ({ key })) }; },
   };
 });
 
@@ -36,7 +40,9 @@ const U = "https://site.test";
 const KEY = process.env.PUBLISH_KEY;
 const ctx = (ip = "1.2.3.4") => ({ ip });
 const post = (path, body, headers = {}) => new Request(U + path, { method: "POST", body, headers });
-const pub = (raw, headers = {}, ip) => publish(post("/api/publish", typeof raw === "string" ? raw : JSON.stringify(raw), { "x-publish-key": KEY, ...headers }), ctx(ip));
+// what the ONE flow forwards: the Excel script's envelope, plus the master key header
+const env = (raw, key) => JSON.stringify({ v: 1, projectKey: key ?? projectKey(titleCode(raw.title)) ?? "x", by: "Samarth B S", snapshot: raw });
+const pub = (raw, headers = {}, ip, key) => publish(post("/api/publish", typeof raw === "string" ? raw : env(raw, key), { "x-publish-key": KEY, ...headers }), ctx(ip));
 const form = (o) => new URLSearchParams(o).toString();
 const doLogin = (project, password, ip = "9.9.9.9") =>
   login(post("/api/login", form({ project, password }), { "content-type": "application/x-www-form-urlencoded" }), ctx(ip));
@@ -59,14 +65,14 @@ test("publish: key brute force gets locked (429)", async () => {
 });
 test("publish: bad body, too large, invalid data", async () => {
   assert.equal((await pub("{not json")).status, 400);
-  assert.equal((await pub("x".repeat(70000))).status, 413);
+  assert.equal((await pub("x".repeat(130000))).status, 413);
   const bad = raw("ORB2"); bad.phases[0].actual = 1.5;
   const r = await pub(bad); assert.equal(r.status, 422);
   assert.match(JSON.stringify(await r.json()), /between 0 and 100/);
   assert.equal(mem.snapshots?.has("ORB2/current") ?? false, false);
 });
 test("publish: good ORB2 data is accepted, stored and reported", async () => {
-  const r = await pub(raw("ORB2"), { "x-published-by": "Samarth B S" });
+  const r = await pub(raw("ORB2"));
   assert.equal(r.status, 200);
   const j = await r.json();
   assert.deepEqual([j.ok, j.project, j.week, j.actual, j.planned, j.spi], [true, "ORB2", 24, 31.6, 35.9, 0.88]);
@@ -76,7 +82,7 @@ test("publish: good ORB2 data is accepted, stored and reported", async () => {
   assert.equal((await status(new Request(U + "/api/status?project=ORB2"))).status, 401);
 });
 test("publish: flow may send the JSON wrapped once as a string", async () => {
-  const r = await pub(JSON.stringify(JSON.stringify(raw("ORB2"))));
+  const r = await pub(JSON.stringify(env(raw("ORB2"))));
   assert.equal(r.status, 200);
 });
 test("publish: an OLDER week is refused (409) unless forced", async () => {
@@ -189,7 +195,7 @@ test("logout clears the cookie; health needs the key and never shows secrets", a
   assert.ok(!txt.includes(KEY) && !txt.includes("Orion-Pass-2026"));
   const j = JSON.parse(txt);
   assert.equal(j.storage_ok, true); assert.equal(j.session_secret_ok, true);
-  assert.deepEqual(j.projects, [{ project: "ORB2", password_set: true }, { project: "HLX3", password_set: true }]);
+  assert.deepEqual(j.projects, [{ project: "HLX3", source: "code", password_set: true }, { project: "ORB2", source: "code", password_set: true }]);
 });
 test("audit trail records publishes and logins, and no passwords", async () => {
   const all = [...mem.audit.values()].join("\n");
@@ -201,4 +207,114 @@ test("stored snapshot contains only allow-listed data", async () => {
   assert.deepEqual(Object.keys(rec.snapshot).sort(), ["D", "client", "dates", "days_left", "overall", "project", "template_version", "total_weeks", "week"]);
   assert.deepEqual(Object.keys(rec.snapshot.D).sort(), ["ms", "ph", "sc"]);
   assert.equal(rec.snapshot.D.ms.length, 12); assert.equal(rec.snapshot.D.ph.length, 7); assert.equal(rec.snapshot.D.sc.length, 60);
+});
+
+
+// ---------------- v3: one script + one flow for every project ----------------
+const LOGO = G("ORB2.logo.txt");
+const pngBlob = () => new Blob([Buffer.from(LOGO.split(",")[1], "base64")], { type: "image/png" });
+const adminPost = (fields, ip = "7.7.7.7") => {
+  const fd = new FormData();
+  for (const [k, v] of Object.entries(fields)) fd.append(k, v);
+  return admin(new Request(U + "/api/admin", { method: "POST", body: fd }), ctx(ip));
+};
+const agv1 = () => { const r = raw("ORB2"); r.title = "PROJECT : AMGEN - AGV1-R&D LAB - PHASE I"; return r; };
+
+test("v3: the flow address alone cannot publish (project key required)", async () => {
+  const r1 = await pub(raw("ORB2"), {}, "8.1.1.1", "");
+  assert.equal(r1.status, 401);
+  const r2 = await publish(post("/api/publish", JSON.stringify(raw("ORB2")), { "x-publish-key": KEY }), ctx("8.1.1.2"));
+  assert.equal(r2.status, 401);
+  assert.match(JSON.stringify(await r2.json()), /project key/);
+});
+test("v3: one project's key cannot publish another project", async () => {
+  const r = await pub(raw("ORB2"), {}, "8.2.2.2", projectKey("HLX3"));
+  assert.equal(r.status, 401);
+  assert.match(JSON.stringify(await r.json()), /does not belong to project ORB2/);
+});
+test("v3: without the flow's master key, Excel cannot publish directly (default)", async () => {
+  const r = await publish(post("/api/publish", env(raw("ORB2"))), ctx("8.3.3.3"));
+  assert.equal(r.status, 401);
+  assert.equal((await publish(new Request(U + "/api/publish", { method: "OPTIONS" }), ctx())).status, 405);
+});
+test("v3: the flow may pass the body through as base64 ($content)", async () => {
+  const b = JSON.stringify({ "$content-type": "text/plain", "$content": Buffer.from(env(raw("ORB2"))).toString("base64") });
+  const r = await publish(post("/api/publish", b, { "x-publish-key": KEY, "x-force": "1" }), ctx("8.4.4.4"));
+  assert.equal(r.status, 200);
+});
+test("v3: admin page is off without ADMIN_KEY, and needs the right key", async () => {
+  delete process.env.ADMIN_KEY;
+  assert.equal((await admin(new Request(U + "/admin"), ctx())).status, 503);
+  process.env.ADMIN_KEY = "a".repeat(32);
+  assert.equal((await admin(new Request(U + "/admin"), ctx())).status, 200);
+  const bad = await adminPost({ admin_key: "wrong", code: "AGV1", client_token: "AMGEN", password: "Amgen-Pass-2026", logo: pngBlob() }, "7.0.0.1");
+  assert.equal(bad.status, 401);
+  let last; for (let i = 0; i < 6; i++) last = await adminPost({ admin_key: "wrong" + i, code: "AGV1" }, "7.0.0.2");
+  assert.equal(last.status, 429);
+});
+test("v3: admin rejects bad input (code, client, password, non-PNG logo)", async () => {
+  const k = process.env.ADMIN_KEY;
+  assert.equal((await adminPost({ admin_key: k, code: "a b", client_token: "AMGEN", password: "Amgen-Pass-2026", logo: pngBlob() })).status, 400);
+  assert.equal((await adminPost({ admin_key: k, code: "AGV1", client_token: "<x>", password: "Amgen-Pass-2026", logo: pngBlob() })).status, 400);
+  assert.equal((await adminPost({ admin_key: k, code: "AGV1", client_token: "AMGEN", password: "short", logo: pngBlob() })).status, 400);
+  assert.equal((await adminPost({ admin_key: k, code: "AGV1", client_token: "AMGEN", password: "Amgen-Pass-2026", logo: new Blob(["GIF89a"], { type: "image/png" }) })).status, 400);
+  assert.equal((await adminPost({ admin_key: k, code: "AGV1", client_token: "AMGEN", password: "Amgen-Pass-2026" })).status, 400); // logo needed
+});
+test("v3: a project added on the admin page publishes and logs in with no redeploy", async () => {
+  const k = process.env.ADMIN_KEY;
+  assert.equal((await pub(agv1(), {}, "8.5.5.5")).status, 422); // not registered yet
+  const res = await adminPost({ admin_key: k, code: "AGV1", client_token: "AMGEN", password: "Amgen-Pass-2026", logo: pngBlob() });
+  assert.equal(res.status, 200);
+  const page = await res.text();
+  assert.ok(page.includes(projectKey("AGV1")));
+  assert.ok(!page.includes("Amgen-Pass-2026"));
+  const stored = JSON.parse(mem.projects.get("AGV1"));
+  assert.match(stored.pw_hash, /^pbkdf2\$/); assert.ok(!JSON.stringify(stored).includes("Amgen-Pass-2026"));
+  const p = await pub(agv1(), {}, "8.5.5.6");
+  assert.equal(p.status, 200);
+  assert.equal((await doLogin("AGV1", "wrong-password", "9.1.1.1")).status, 401);
+  const ok = await doLogin("AGV1", "Amgen-Pass-2026", "9.1.1.2");
+  assert.equal(ok.status, 303);
+  const dash = await get("/p/AGV1", cookieOf(ok));
+  const t = await dash.text();
+  assert.equal(dash.status, 200); assert.match(t, /Week 24 of 60/); assert.match(t, /Amgen/);
+  const other = await get("/p/ORB2", cookieOf(ok));     // AGV1 session does not open ORB2
+  assert.match(await other.text(), /Enter the password/);
+});
+test("v3: admin can update a project (keep logo, change password) and show its key", async () => {
+  const k = process.env.ADMIN_KEY;
+  const before = JSON.parse(mem.projects.get("AGV1"));
+  assert.equal((await adminPost({ admin_key: k, code: "AGV1", client_token: "AMGEN", password: "New-Amgen-Pass-1" })).status, 200);
+  const after = JSON.parse(mem.projects.get("AGV1"));
+  assert.equal(after.logo, before.logo); assert.notEqual(after.pw_hash, before.pw_hash); assert.equal(after.created_at, before.created_at);
+  assert.equal((await doLogin("AGV1", "Amgen-Pass-2026", "9.2.2.1")).status, 401);
+  assert.equal((await doLogin("AGV1", "New-Amgen-Pass-1", "9.2.2.2")).status, 303);
+  const show = await adminPost({ admin_key: k, code: "AGV1", action: "key" });
+  assert.ok((await show.text()).includes(projectKey("AGV1")));
+  const h = await (await health(new Request(U + "/api/health", { headers: { "x-publish-key": KEY } }))).json();
+  assert.ok(h.projects.some((x) => x.project === "AGV1" && x.source === "admin" && x.password_set));
+  assert.equal(h.admin_ok, true);
+});
+test("v3: optional direct mode (ALLOW_DIRECT=1) answers browser checks and still needs the project key", async () => {
+  process.env.ALLOW_DIRECT = "1";
+  try {
+    const o = await publish(new Request(U + "/api/publish", { method: "OPTIONS" }), ctx());
+    assert.equal(o.status, 204); assert.equal(o.headers.get("access-control-allow-origin"), "*");
+    assert.equal((await publish(post("/api/publish", env(raw("ORB2"), "pk_wrong")), ctx("8.6.6.1"))).status, 401);
+    const r = await publish(post("/api/publish", env(raw("ORB2")), { "x-force": "1" }), ctx("8.6.6.2"));
+    assert.equal(r.status, 200); assert.equal(r.headers.get("access-control-allow-origin"), "*");
+  } finally { delete process.env.ALLOW_DIRECT; }
+});
+test("v3: legacy flow (old 3 scripts) only works when LEGACY_PUBLISH=1", async () => {
+  const bare = JSON.stringify(raw("ORB2"));
+  assert.equal((await publish(post("/api/publish", bare, { "x-publish-key": KEY, "x-force": "1" }), ctx("8.7.7.1"))).status, 401);
+  process.env.LEGACY_PUBLISH = "1";
+  try { assert.equal((await publish(post("/api/publish", bare, { "x-publish-key": KEY, "x-force": "1" }), ctx("8.7.7.2"))).status, 200); }
+  finally { delete process.env.LEGACY_PUBLISH; }
+});
+test("v3: project keys are stable, unique and secret-derived", () => {
+  assert.equal(projectKey("ORB2"), projectKey("ORB2"));
+  assert.notEqual(projectKey("ORB2"), projectKey("AGV1"));
+  assert.match(projectKey("ORB2"), /^pk_[A-Za-z0-9_-]{32}$/);
+  assert.equal(projectKey("bad code"), null);
 });

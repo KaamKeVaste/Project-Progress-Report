@@ -29,6 +29,12 @@ const BAD_CHARS = /[\u0000-\u001f\u007f<>]/;
 function okText(v, max) { return typeof v === "string" && v.length > 0 && v.length <= max && !BAD_CHARS.test(v); }
 
 // Shows the name exactly as typed in the workbook (only the ◆ marker and extra spaces are removed).
+// Project code written in the workbook title (Dashboard!B3), or null.
+export function titleCode(title) {
+  const m = typeof title === "string" && title.length <= 120 ? TITLE_RE.exec(title) : null;
+  return m ? m[2] : null;
+}
+
 export function cleanName(raw) {
   return String(raw).replace(/◆/g, "").replace(/\s+/g, " ").trim();
 }
